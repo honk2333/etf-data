@@ -9,7 +9,7 @@
 ## 环境
 
 - Conda 环境：`multifactor-etf`
-- 依赖：`tickflow`、`duckdb`、`pandas`
+- 依赖：`tickflow`、`duckdb`、`pandas`、`exchange_calendars`
 
 ## ETF 列表文件
 

@@ -7,10 +7,13 @@ import re
 import sys
 import time
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Iterable
+from zoneinfo import ZoneInfo
 
 import duckdb
+import exchange_calendars as xcals
 import pandas as pd
 from tickflow import TickFlow
 
@@ -38,6 +41,7 @@ SYMBOL_CANDIDATES = [
     "证券代码",
     "基金代码",
 ]
+TRADE_TIMEZONE = ZoneInfo("Asia/Shanghai")
 
 
 @dataclass
@@ -94,12 +98,6 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--limit", type=int, default=None, help="Limit number of symbols for testing"
-    )
-    parser.add_argument(
-        "--api-key",
-        type=str,
-        default=None,
-        help="TickFlow API key; fallback to env TICKFLOW_API_KEY",
     )
     return parser.parse_args()
 
@@ -213,6 +211,21 @@ def get_last_timestamp(conn: duckdb.DuckDBPyConnection, symbol: str) -> int | No
     if row is None or row[0] is None:
         return None
     return int(row[0])
+
+
+def get_market_latest_timestamp_from_calendar() -> tuple[int, str]:
+    cal = xcals.get_calendar("XSHG")
+    now = pd.Timestamp.now(tz=str(TRADE_TIMEZONE))
+    latest_session = cal.date_to_session(now.date(), direction="previous")
+    latest_date = latest_session.date()
+    latest_date_str = latest_date.isoformat()
+    latest_dt = datetime(
+        latest_date.year,
+        latest_date.month,
+        latest_date.day,
+        tzinfo=TRADE_TIMEZONE,
+    )
+    return int(latest_dt.timestamp() * 1000), latest_date_str
 
 
 def fetch_since(
@@ -403,6 +416,8 @@ def main() -> int:
 
     client = create_client(args.api_key)
     throttle_state: dict = {"last_call_at": None}
+    market_latest_ts, market_latest_date = get_market_latest_timestamp_from_calendar()
+    print(f"Market latest trade date (calendar): {market_latest_date}")
 
     stats = SyncStats(total=len(symbols))
     interrupted = False
@@ -411,6 +426,12 @@ def main() -> int:
         for idx, symbol in enumerate(symbols, start=1):
             last_ts = get_last_timestamp(conn, symbol)
             start_ts = 0 if last_ts is None else (last_ts + 1)
+            if last_ts is not None and last_ts >= market_latest_ts:
+                stats.skipped_symbols += 1
+                print(
+                    f"[{idx}/{stats.total}] {symbol} no new rows (already at market latest)"
+                )
+                continue
 
             try:
                 new_data = fetch_since(
