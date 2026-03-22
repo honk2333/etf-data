@@ -109,9 +109,7 @@ def normalize_symbol(raw_code: str) -> str:
     return f"{digits}.{suffix}"
 
 
-def load_symbols(
-    etf_list: Path, limit: int | None
-) -> list[str]:
+def load_symbols(etf_list: Path, limit: int | None) -> list[str]:
     if not etf_list.exists():
         raise FileNotFoundError(f"ETF list CSV not found: {etf_list}")
 
@@ -141,13 +139,6 @@ def load_symbols(
     if limit is not None:
         return deduped[:limit]
     return deduped
-
-
-def create_client(api_key: str | None) -> TickFlow:
-    key = api_key or os.getenv("TICKFLOW_API_KEY")
-    if key:
-        return TickFlow(api_key=key)
-    return TickFlow.free()
 
 
 def init_db(conn: duckdb.DuckDBPyConnection) -> None:
@@ -382,7 +373,7 @@ def main() -> int:
     conn = duckdb.connect(str(args.db_path))
     init_db(conn)
 
-    client = create_client(args.api_key)
+    client = TickFlow.free()
     throttle_state: dict = {"last_call_at": None}
     market_latest_ts, market_latest_date = get_market_latest_timestamp_from_calendar()
     print(f"Market latest trade date (calendar): {market_latest_date}")

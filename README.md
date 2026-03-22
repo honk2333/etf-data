@@ -30,7 +30,6 @@ python scripts/update_etf_daily.py \
 
 可选参数：
 
-- `--api-key`：TickFlow API Key（不传则读 `TICKFLOW_API_KEY`；再没有则走 `TickFlow.free()`）
 - `--limit`：仅同步前 N 个标的（调试用）
 - `--batch-size`：每次请求条数（默认 10000）
 - `--sleep-seconds`：请求最小间隔秒数（默认 1.10，避免免费接口限流）
