@@ -9,7 +9,6 @@ import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Iterable
 from zoneinfo import ZoneInfo
 
 import duckdb
@@ -31,16 +30,6 @@ REQUIRED_KLINE_COLUMNS = [
     "amount",
 ]
 
-SYMBOL_CANDIDATES = [
-    "代码",
-    "symbol",
-    "ts_code",
-    "code",
-    "ticker",
-    "fund_code",
-    "证券代码",
-    "基金代码",
-]
 TRADE_TIMEZONE = ZoneInfo("Asia/Shanghai")
 
 
@@ -68,12 +57,6 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=Path("data/etf_daily.duckdb"),
         help="DuckDB file path",
-    )
-    parser.add_argument(
-        "--symbol-column",
-        type=str,
-        default=None,
-        help="Symbol column name in ETF list CSV",
     )
     parser.add_argument(
         "--batch-size", type=int, default=10000, help="Each TickFlow request row count"
@@ -106,15 +89,6 @@ def ensure_parent(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
 
 
-def infer_column(columns: Iterable[str], candidates: list[str]) -> str | None:
-    lower_map = {re.sub(r"\s+", "", c).strip().lower(): c for c in columns}
-    for name in candidates:
-        key = re.sub(r"\s+", "", name).strip().lower()
-        if key in lower_map:
-            return lower_map[key]
-    return None
-
-
 def normalize_symbol(raw_code: str) -> str:
     code = str(raw_code).strip().upper()
     code = re.sub(r"\s+", "", code)
@@ -136,7 +110,7 @@ def normalize_symbol(raw_code: str) -> str:
 
 
 def load_symbols(
-    etf_list: Path, symbol_column: str | None, limit: int | None
+    etf_list: Path, limit: int | None
 ) -> list[str]:
     if not etf_list.exists():
         raise FileNotFoundError(f"ETF list CSV not found: {etf_list}")
@@ -147,16 +121,10 @@ def load_symbols(
 
     df.columns = [str(c).strip() for c in df.columns]
 
-    if symbol_column:
-        symbol_col = infer_column(df.columns, [symbol_column])
-    else:
-        symbol_col = infer_column(df.columns, SYMBOL_CANDIDATES)
-        if symbol_col is None and len(df.columns) > 0:
-            symbol_col = df.columns[0]
-
-    if not symbol_col:
+    symbol_col = "代码"
+    if symbol_col not in df.columns:
         raise ValueError(
-            "Cannot infer symbol column. Please pass --symbol-column. "
+            "ETF list must contain fixed column '代码'. "
             f"Current columns: {list(df.columns)}"
         )
 
@@ -405,7 +373,7 @@ def upsert_rows(conn: duckdb.DuckDBPyConnection, df: pd.DataFrame) -> None:
 def main() -> int:
     args = parse_args()
 
-    symbols = load_symbols(args.etf_list, args.symbol_column, args.limit)
+    symbols = load_symbols(args.etf_list, args.limit)
     if not symbols:
         print("No symbols found in ETF list.", file=sys.stderr)
         return 1
