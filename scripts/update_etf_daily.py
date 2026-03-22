@@ -83,8 +83,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--sleep-seconds",
         type=float,
-        default=0.05,
-        help="Sleep between TickFlow requests",
+        default=1.10,
+        help="Min interval between TickFlow requests (seconds)",
     )
     parser.add_argument(
         "--max-retries",
@@ -97,6 +97,12 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=3.0,
         help="Default retry interval seconds",
+    )
+    parser.add_argument(
+        "--checkpoint-every",
+        type=int,
+        default=20,
+        help="Export CSV every N symbols (0 means only export at end)",
     )
     parser.add_argument(
         "--limit", type=int, default=None, help="Limit number of symbols for testing"
@@ -242,6 +248,7 @@ def fetch_since(
     sleep_seconds: float,
     max_retries: int,
     retry_seconds: float,
+    throttle_state: dict,
 ) -> pd.DataFrame:
     frames: list[pd.DataFrame] = []
     end_time: int | None = None
@@ -262,6 +269,8 @@ def fetch_since(
             kwargs=kwargs,
             max_retries=max_retries,
             retry_seconds=retry_seconds,
+            min_interval_seconds=sleep_seconds,
+            throttle_state=throttle_state,
         )
         if chunk is None or chunk.empty:
             break
@@ -279,9 +288,6 @@ def fetch_since(
         if end_time is not None and next_end >= end_time:
             break
         end_time = next_end
-
-        if sleep_seconds > 0:
-            time.sleep(sleep_seconds)
 
     if not frames:
         return pd.DataFrame(columns=REQUIRED_KLINE_COLUMNS)
@@ -319,7 +325,7 @@ def extract_retry_seconds(message: str, fallback: float) -> float:
             continue
         value = float(match.group(1))
         if "毫秒" in pattern or "ms" in pattern:
-            return max(0.2, value / 1000.0)
+            return max(0.2, value / 1000.0 + 1.0)
         return max(0.2, value)
     return max(0.2, fallback)
 
@@ -330,9 +336,17 @@ def get_chunk_with_retry(
     kwargs: dict,
     max_retries: int,
     retry_seconds: float,
+    min_interval_seconds: float,
+    throttle_state: dict,
 ):
     for attempt in range(max_retries + 1):
         try:
+            if min_interval_seconds > 0:
+                last_call = throttle_state.get("last_call_at")
+                if last_call is not None:
+                    wait_seconds = min_interval_seconds - (time.monotonic() - last_call)
+                    if wait_seconds > 0:
+                        time.sleep(wait_seconds)
             return client.klines.get(symbol, **kwargs)
         except Exception as exc:  # noqa: BLE001
             message = str(exc)
@@ -347,6 +361,8 @@ def get_chunk_with_retry(
                 file=sys.stderr,
             )
             time.sleep(sleep_for)
+        finally:
+            throttle_state["last_call_at"] = time.monotonic()
     raise RuntimeError("Unreachable retry state")
 
 
@@ -425,60 +441,69 @@ def main() -> int:
     init_db(conn)
 
     client = create_client(args.api_key)
+    throttle_state: dict = {"last_call_at": None}
 
     stats = SyncStats(total=len(symbols))
+    interrupted = False
 
-    for idx, symbol in enumerate(symbols, start=1):
-        last_ts = get_last_timestamp(conn, symbol)
-        start_ts = 0 if last_ts is None else (last_ts + 1)
+    try:
+        for idx, symbol in enumerate(symbols, start=1):
+            last_ts = get_last_timestamp(conn, symbol)
+            start_ts = 0 if last_ts is None else (last_ts + 1)
 
-        try:
-            new_data = fetch_since(
-                client=client,
-                symbol=symbol,
-                start_time_ms=start_ts,
-                batch_size=args.batch_size,
-                sleep_seconds=args.sleep_seconds,
-                max_retries=args.max_retries,
-                retry_seconds=args.retry_seconds,
-            )
-        except Exception as exc:  # noqa: BLE001
-            stats.error_symbols += 1
-            print(f"[{idx}/{stats.total}] {symbol} ERROR: {exc}", file=sys.stderr)
-            continue
+            try:
+                new_data = fetch_since(
+                    client=client,
+                    symbol=symbol,
+                    start_time_ms=start_ts,
+                    batch_size=args.batch_size,
+                    sleep_seconds=args.sleep_seconds,
+                    max_retries=args.max_retries,
+                    retry_seconds=args.retry_seconds,
+                    throttle_state=throttle_state,
+                )
+            except Exception as exc:  # noqa: BLE001
+                stats.error_symbols += 1
+                print(f"[{idx}/{stats.total}] {symbol} ERROR: {exc}", file=sys.stderr)
+                continue
 
-        if new_data.empty:
-            stats.skipped_symbols += 1
-            print(f"[{idx}/{stats.total}] {symbol} no new rows")
-            continue
+            if new_data.empty:
+                stats.skipped_symbols += 1
+                print(f"[{idx}/{stats.total}] {symbol} no new rows")
+            else:
+                upsert_rows(conn, new_data)
+                stats.updated_symbols += 1
+                stats.fetched_rows += len(new_data)
 
-        upsert_rows(conn, new_data)
-        stats.updated_symbols += 1
-        stats.fetched_rows += len(new_data)
+                first_date = str(new_data["trade_date"].iloc[0])
+                last_date = str(new_data["trade_date"].iloc[-1])
+                mode = "init" if last_ts is None else "incr"
+                print(
+                    f"[{idx}/{stats.total}] {symbol} {mode} +{len(new_data)} rows ({first_date} -> {last_date})"
+                )
 
-        first_date = str(new_data["trade_date"].iloc[0])
-        last_date = str(new_data["trade_date"].iloc[-1])
-        mode = "init" if last_ts is None else "incr"
-        print(
-            f"[{idx}/{stats.total}] {symbol} {mode} +{len(new_data)} rows ({first_date} -> {last_date})"
+            if args.checkpoint_every > 0 and idx % args.checkpoint_every == 0:
+                export_csv(conn, args.output_csv)
+                print(f"[checkpoint] exported csv at {idx}/{stats.total}")
+    except KeyboardInterrupt:
+        interrupted = True
+        print("\nInterrupted by user. Saving partial data...", file=sys.stderr)
+    finally:
+        conn.execute(
+            """
+            INSERT INTO sync_runs (total_symbols, updated_symbols, skipped_symbols, error_symbols, fetched_rows)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            [
+                stats.total,
+                stats.updated_symbols,
+                stats.skipped_symbols,
+                stats.error_symbols,
+                stats.fetched_rows,
+            ],
         )
-
-    conn.execute(
-        """
-        INSERT INTO sync_runs (total_symbols, updated_symbols, skipped_symbols, error_symbols, fetched_rows)
-        VALUES (?, ?, ?, ?, ?)
-        """,
-        [
-            stats.total,
-            stats.updated_symbols,
-            stats.skipped_symbols,
-            stats.error_symbols,
-            stats.fetched_rows,
-        ],
-    )
-
-    export_csv(conn, args.output_csv)
-    conn.close()
+        export_csv(conn, args.output_csv)
+        conn.close()
 
     print("=" * 72)
     print(
@@ -488,6 +513,8 @@ def main() -> int:
     )
     print(f"DuckDB: {args.db_path}")
     print(f"CSV:    {args.output_csv}")
+    if interrupted:
+        return 130
     return 0
 
 

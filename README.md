@@ -37,8 +37,9 @@ conda run -n multifactor-etf python scripts/update_etf_daily.py \
 - `--api-key`：TickFlow API Key（不传则读 `TICKFLOW_API_KEY`；再没有则走 `TickFlow.free()`）
 - `--symbol-column`：手动指定 ETF 代码列名
 - `--limit`：仅同步前 N 个标的（调试用）
-- `--batch-size`：每次请求条数（默认 500）
-- `--sleep-seconds`：请求间隔秒数（默认 0.05）
+- `--batch-size`：每次请求条数（默认 10000）
+- `--sleep-seconds`：请求最小间隔秒数（默认 1.10，避免免费接口限流）
+- `--checkpoint-every`：每同步 N 个标的导出一次 CSV（默认 20，`0` 表示只在结束时导出）
 
 ## 输出
 
