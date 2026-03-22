@@ -1,10 +1,10 @@
-# ETF 日线数据管理（TickFlow + CSV + DuckDB）
+# ETF 日线数据管理（TickFlow + DuckDB）
 
 这个项目提供一个可直接运行的增量同步脚本：
 
 - 首次：从 TickFlow 回补 ETF 从可获得最早日期到最新日期的日线数据
 - 后续：只抓取上次更新后缺失的日线数据（不重复全量拉取）
-- 存储：落地到 DuckDB（主存储）并导出总 CSV
+- 存储：只落地到 DuckDB
 
 ## 环境
 
@@ -16,7 +16,6 @@
 默认读取 `data/etf_list.csv`。
 
 - 自动识别代码列（例如：`symbol` / `ts_code` / `code` / `基金代码`）
-- 自动识别交易所列（例如：`exchange` / `market` / `交易所`）
 - 若代码是 `510300` 这类 6 位数字，会自动标准化为 `510300.SH` / `159915.SZ`
 
 示例见 [examples/etf_list.sample.csv](/Users/hongke/代码/etf-data/examples/etf_list.sample.csv)。
@@ -26,10 +25,9 @@
 先准备 ETF 列表文件，然后执行：
 
 ```bash
-conda run -n multifactor-etf python scripts/update_etf_daily.py \
+python scripts/update_etf_daily.py \
   --etf-list data/etf_list.csv \
-  --db-path data/etf_daily.duckdb \
-  --output-csv data/etf_daily.csv
+  --db-path data/etf_daily.duckdb
 ```
 
 可选参数：
@@ -39,9 +37,7 @@ conda run -n multifactor-etf python scripts/update_etf_daily.py \
 - `--limit`：仅同步前 N 个标的（调试用）
 - `--batch-size`：每次请求条数（默认 10000）
 - `--sleep-seconds`：请求最小间隔秒数（默认 1.10，避免免费接口限流）
-- `--checkpoint-every`：每同步 N 个标的导出一次 CSV（默认 20，`0` 表示只在结束时导出）
 
 ## 输出
 
 - DuckDB：`data/etf_daily.duckdb`，主表 `etf_daily`
-- CSV：`data/etf_daily.csv`（每次同步后按 `symbol + trade_date` 全量导出）

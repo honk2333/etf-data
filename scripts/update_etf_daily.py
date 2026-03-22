@@ -66,12 +66,6 @@ def parse_args() -> argparse.Namespace:
         help="DuckDB file path",
     )
     parser.add_argument(
-        "--output-csv",
-        type=Path,
-        default=Path("data/etf_daily.csv"),
-        help="Merged output CSV path",
-    )
-    parser.add_argument(
         "--symbol-column",
         type=str,
         default=None,
@@ -83,7 +77,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--sleep-seconds",
         type=float,
-        default=1.10,
+        default=1.0,
         help="Min interval between TickFlow requests (seconds)",
     )
     parser.add_argument(
@@ -97,12 +91,6 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=3.0,
         help="Default retry interval seconds",
-    )
-    parser.add_argument(
-        "--checkpoint-every",
-        type=int,
-        default=20,
-        help="Export CSV every N symbols (0 means only export at end)",
     )
     parser.add_argument(
         "--limit", type=int, default=None, help="Limit number of symbols for testing"
@@ -213,19 +201,6 @@ def init_db(conn: duckdb.DuckDBPyConnection) -> None:
             amount DOUBLE,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             PRIMARY KEY(symbol, trade_date)
-        );
-        """
-    )
-
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS sync_runs (
-            run_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            total_symbols INTEGER,
-            updated_symbols INTEGER,
-            skipped_symbols INTEGER,
-            error_symbols INTEGER,
-            fetched_rows INTEGER
         );
         """
     )
@@ -414,20 +389,6 @@ def upsert_rows(conn: duckdb.DuckDBPyConnection, df: pd.DataFrame) -> None:
     conn.unregister("incoming_klines")
 
 
-def export_csv(conn: duckdb.DuckDBPyConnection, output_csv: Path) -> None:
-    ensure_parent(output_csv)
-    escaped = str(output_csv).replace("'", "''")
-    conn.execute(
-        f"""
-        COPY (
-            SELECT symbol, name, timestamp, trade_date, trade_time, open, high, low, close, volume, amount
-            FROM etf_daily
-            ORDER BY symbol, trade_date
-        ) TO '{escaped}' (HEADER, DELIMITER ',');
-        """
-    )
-
-
 def main() -> int:
     args = parse_args()
 
@@ -481,28 +442,10 @@ def main() -> int:
                 print(
                     f"[{idx}/{stats.total}] {symbol} {mode} +{len(new_data)} rows ({first_date} -> {last_date})"
                 )
-
-            if args.checkpoint_every > 0 and idx % args.checkpoint_every == 0:
-                export_csv(conn, args.output_csv)
-                print(f"[checkpoint] exported csv at {idx}/{stats.total}")
     except KeyboardInterrupt:
         interrupted = True
-        print("\nInterrupted by user. Saving partial data...", file=sys.stderr)
+        print("\nInterrupted by user.", file=sys.stderr)
     finally:
-        conn.execute(
-            """
-            INSERT INTO sync_runs (total_symbols, updated_symbols, skipped_symbols, error_symbols, fetched_rows)
-            VALUES (?, ?, ?, ?, ?)
-            """,
-            [
-                stats.total,
-                stats.updated_symbols,
-                stats.skipped_symbols,
-                stats.error_symbols,
-                stats.fetched_rows,
-            ],
-        )
-        export_csv(conn, args.output_csv)
         conn.close()
 
     print("=" * 72)
@@ -512,7 +455,6 @@ def main() -> int:
         f"skipped={stats.skipped_symbols}, errors={stats.error_symbols}, rows={stats.fetched_rows}"
     )
     print(f"DuckDB: {args.db_path}")
-    print(f"CSV:    {args.output_csv}")
     if interrupted:
         return 130
     return 0
