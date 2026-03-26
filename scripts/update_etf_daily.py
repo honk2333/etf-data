@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import argparse
-import os
 import re
 import sys
 import time
@@ -11,6 +10,7 @@ from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+import akshare as ak
 import duckdb
 import exchange_calendars as xcals
 import pandas as pd
@@ -44,7 +44,7 @@ class SyncStats:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Incrementally sync ETF daily bars from TickFlow into DuckDB."
+        description="Incrementally sync ETF daily bars from selected source into DuckDB."
     )
     parser.add_argument(
         "--etf-list",
@@ -59,13 +59,20 @@ def parse_args() -> argparse.Namespace:
         help="DuckDB file path",
     )
     parser.add_argument(
+        "--source",
+        type=str,
+        choices=["tickflow", "sina"],
+        default="tickflow",
+        help="Data source for ETF daily bars",
+    )
+    parser.add_argument(
         "--batch-size", type=int, default=10000, help="Each TickFlow request row count"
     )
     parser.add_argument(
         "--sleep-seconds",
         type=float,
         default=1.0,
-        help="Min interval between TickFlow requests (seconds)",
+        help="Min interval between requests (seconds)",
     )
     parser.add_argument(
         "--max-retries",
@@ -175,7 +182,16 @@ def get_last_timestamp(conn: duckdb.DuckDBPyConnection, symbol: str) -> int | No
 def get_market_latest_timestamp_from_calendar() -> tuple[int, str]:
     cal = xcals.get_calendar("XSHG")
     now = pd.Timestamp.now(tz=str(TRADE_TIMEZONE))
-    latest_session = cal.date_to_session(now.date(), direction="previous")
+    if cal.is_session(now.date()):
+        today_session = cal.date_to_session(now.date(), direction="none")
+        today_close_utc = cal.session_close(today_session)
+        now_utc = now.tz_convert("UTC")
+        if now_utc < today_close_utc:
+            latest_session = cal.previous_session(today_session)
+        else:
+            latest_session = today_session
+    else:
+        latest_session = cal.date_to_session(now.date(), direction="previous")
     latest_date = latest_session.date()
     latest_date_str = latest_date.isoformat()
     latest_dt = datetime(
@@ -187,7 +203,12 @@ def get_market_latest_timestamp_from_calendar() -> tuple[int, str]:
     return int(latest_dt.timestamp() * 1000), latest_date_str
 
 
-def fetch_since(
+def to_sina_symbol(symbol: str) -> str:
+    code, market = symbol.split(".")
+    return f"{market.lower()}{code}"
+
+
+def fetch_since_tickflow(
     client: TickFlow,
     symbol: str,
     start_time_ms: int,
@@ -244,6 +265,55 @@ def fetch_since(
     data = data.drop_duplicates(subset=["symbol", "trade_date"], keep="last")
     data = data.sort_values(["symbol", "timestamp"]).reset_index(drop=True)
     return data
+
+
+def fetch_since_sina(
+    symbol: str,
+    start_time_ms: int,
+    sleep_seconds: float,
+    max_retries: int,
+    retry_seconds: float,
+    throttle_state: dict,
+) -> pd.DataFrame:
+    sina_symbol = to_sina_symbol(symbol)
+    raw = get_sina_hist_with_retry(
+        sina_symbol=sina_symbol,
+        max_retries=max_retries,
+        retry_seconds=retry_seconds,
+        min_interval_seconds=sleep_seconds,
+        throttle_state=throttle_state,
+    )
+    if raw is None or raw.empty:
+        return pd.DataFrame(columns=REQUIRED_KLINE_COLUMNS)
+
+    df = raw.copy()
+    trade_time = pd.to_datetime(df["date"])
+    date_str = trade_time.dt.strftime("%Y-%m-%d")
+    timestamp = trade_time.apply(
+        lambda x: int(
+            datetime(x.year, x.month, x.day, tzinfo=TRADE_TIMEZONE).timestamp() * 1000
+        )
+    )
+
+    data = pd.DataFrame(
+        {
+            "symbol": symbol,
+            "name": pd.NA,
+            "timestamp": timestamp.astype("int64"),
+            "trade_date": date_str,
+            "trade_time": trade_time,
+            "open": pd.to_numeric(df["open"], errors="coerce"),
+            "high": pd.to_numeric(df["high"], errors="coerce"),
+            "low": pd.to_numeric(df["low"], errors="coerce"),
+            "close": pd.to_numeric(df["close"], errors="coerce"),
+            "volume": pd.to_numeric(df["volume"], errors="coerce"),
+            "amount": pd.to_numeric(df["amount"], errors="coerce"),
+        }
+    )
+    data = data[data["timestamp"] >= start_time_ms]
+    data = data.drop_duplicates(subset=["symbol", "trade_date"], keep="last")
+    data = data.sort_values(["symbol", "timestamp"]).reset_index(drop=True)
+    return data[REQUIRED_KLINE_COLUMNS]
 
 
 def is_retryable_error(message: str) -> bool:
@@ -313,6 +383,40 @@ def get_chunk_with_retry(
     raise RuntimeError("Unreachable retry state")
 
 
+def get_sina_hist_with_retry(
+    sina_symbol: str,
+    max_retries: int,
+    retry_seconds: float,
+    min_interval_seconds: float,
+    throttle_state: dict,
+):
+    for attempt in range(max_retries + 1):
+        try:
+            if min_interval_seconds > 0:
+                last_call = throttle_state.get("last_call_at")
+                if last_call is not None:
+                    wait_seconds = min_interval_seconds - (time.monotonic() - last_call)
+                    if wait_seconds > 0:
+                        time.sleep(wait_seconds)
+            return ak.fund_etf_hist_sina(symbol=sina_symbol)
+        except Exception as exc:  # noqa: BLE001
+            message = str(exc)
+            if attempt >= max_retries:
+                raise
+            sleep_for = extract_retry_seconds(
+                message, fallback=retry_seconds * (attempt + 1)
+            )
+            print(
+                f"{sina_symbol} retry {attempt + 1}/{max_retries} after {sleep_for:.1f}s "
+                f"because: {message}",
+                file=sys.stderr,
+            )
+            time.sleep(sleep_for)
+        finally:
+            throttle_state["last_call_at"] = time.monotonic()
+    raise RuntimeError("Unreachable retry state")
+
+
 def upsert_rows(conn: duckdb.DuckDBPyConnection, df: pd.DataFrame) -> None:
     if df.empty:
         return
@@ -373,9 +477,10 @@ def main() -> int:
     conn = duckdb.connect(str(args.db_path))
     init_db(conn)
 
-    client = TickFlow.free()
+    client = TickFlow.free() if args.source == "tickflow" else None
     throttle_state: dict = {"last_call_at": None}
     market_latest_ts, market_latest_date = get_market_latest_timestamp_from_calendar()
+    print(f"Source: {args.source}")
     print(f"Market latest trade date (calendar): {market_latest_date}")
 
     stats = SyncStats(total=len(symbols))
@@ -393,16 +498,26 @@ def main() -> int:
                 continue
 
             try:
-                new_data = fetch_since(
-                    client=client,
-                    symbol=symbol,
-                    start_time_ms=start_ts,
-                    batch_size=args.batch_size,
-                    sleep_seconds=args.sleep_seconds,
-                    max_retries=args.max_retries,
-                    retry_seconds=args.retry_seconds,
-                    throttle_state=throttle_state,
-                )
+                if args.source == "tickflow":
+                    new_data = fetch_since_tickflow(
+                        client=client,
+                        symbol=symbol,
+                        start_time_ms=start_ts,
+                        batch_size=args.batch_size,
+                        sleep_seconds=args.sleep_seconds,
+                        max_retries=args.max_retries,
+                        retry_seconds=args.retry_seconds,
+                        throttle_state=throttle_state,
+                    )
+                else:
+                    new_data = fetch_since_sina(
+                        symbol=symbol,
+                        start_time_ms=start_ts,
+                        sleep_seconds=args.sleep_seconds,
+                        max_retries=args.max_retries,
+                        retry_seconds=args.retry_seconds,
+                        throttle_state=throttle_state,
+                    )
             except Exception as exc:  # noqa: BLE001
                 stats.error_symbols += 1
                 print(f"[{idx}/{stats.total}] {symbol} ERROR: {exc}", file=sys.stderr)

@@ -1,2 +1,3 @@
 __pycache__/
 *.wal
+.DS_Store

@@ -1,15 +1,15 @@
-# ETF 日线数据管理（TickFlow + DuckDB）
+# ETF 日线数据管理（TickFlow/Sina + DuckDB）
 
-这个项目提供一个可直接运行的增量同步脚本：
+这个项目提供一个可直接运行的增量同步脚本（支持 TickFlow 或新浪）：
 
-- 首次：从 TickFlow 回补 ETF 从可获得最早日期到最新日期的日线数据
+- 首次：从所选数据源回补 ETF 从可获得最早日期到最新日期的日线数据
 - 后续：只抓取上次更新后缺失的日线数据（不重复全量拉取）
 - 存储：只落地到 DuckDB
 
 ## 环境
 
 - Conda 环境：`multifactor-etf`
-- 依赖：`tickflow`、`duckdb`、`pandas`、`exchange_calendars`
+- 依赖：`tickflow`、`akshare`、`duckdb`、`pandas`、`exchange_calendars`
 
 ## ETF 列表文件
 
@@ -24,15 +24,17 @@
 
 ```bash
 python scripts/update_etf_daily.py \
+  --source sina \
   --etf-list data/etf_list.csv \
   --db-path data/etf_daily.duckdb
 ```
 
 可选参数：
 
+- `--source`：数据源，`tickflow` 或 `sina`（默认 `tickflow`）
 - `--limit`：仅同步前 N 个标的（调试用）
-- `--batch-size`：每次请求条数（默认 10000）
-- `--sleep-seconds`：请求最小间隔秒数（默认 1.10，避免免费接口限流）
+- `--batch-size`：每次请求条数（默认 10000，仅 `tickflow` 有效）
+- `--sleep-seconds`：请求最小间隔秒数（默认 1.0）
 
 ## 输出
 
